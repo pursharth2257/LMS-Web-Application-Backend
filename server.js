@@ -39,11 +39,12 @@ mongoose.connection.on("disconnected", () => {
 // Middleware
 app.use(
   cors({
-    origin: "*",
+    origin: ["http://localhost:5173", "https://lms-frontend.onrender.com"], 
     methods: "GET,POST,PUT,DELETE,PATCH",
     credentials: true,
   })
 );
+
 app.use(express.json());
 app.use(cookieParser());
 app.use(express.urlencoded({ extended: true })); // for form-data
