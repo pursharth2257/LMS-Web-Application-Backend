@@ -27,24 +27,47 @@ export const register = async (req, res, next) => {
     if (phone && !/^\+?[\d\s-]{7,15}$/.test(phone)) {
       return res.status(400).json({
         success: false,
-        message: 'Please provide a valid phone number'
+        message: 'Please provide a valid phone number',
       });
     }
 
     // Check if user already exists
-    const existingUser = await User.findOne({ email });
-    if (existingUser) {
-      return res.status(400).json({
-        success: false,
-        message: 'Email already in use'
-      });
+    let user = await User.findOne({ email });
+    if (user) {
+      if (user.isVerified) {
+        return res.status(400).json({
+          success: false,
+          message: 'Email already registered and verified',
+        });
+      } else {
+        // Resend OTP for unverified user
+        const otp = generateOTP();
+        user.otp = otp;
+        user.otpExpires = Date.now() + 10 * 60 * 1000; // 10 minutes
+        user.phoneOTP = undefined; // Clear phone OTP if previously set
+        user.phoneOTPExpires = undefined;
+        await user.save();
+
+        try {
+          await sendOTPEmail(email, otp);
+        } catch (emailError) {
+          console.error('Email sending failed:', emailError);
+          return res.status(500).json({
+            success: false,
+            message: 'Failed to send OTP email.',
+          });
+        }
+
+        return res.status(200).json({
+          success: true,
+          message: 'A new OTP has been sent to your email.',
+          data: { id: user._id, email: user.email, role: user.role, provider: user.provider },
+        });
+      }
     }
 
     // Create user based on role
-    let user;
     const userData = { firstName, lastName, email, phone, role, provider };
-
-    // Only set password for local provider
     if (provider === 'local') {
       userData.password = password;
     }
@@ -60,7 +83,7 @@ export const register = async (req, res, next) => {
         if (req.user?.role !== 'admin' || !req.user?.isSuperAdmin) {
           return res.status(403).json({
             success: false,
-            message: 'Not authorized to create admin accounts'
+            message: 'Not authorized to create admin accounts',
           });
         }
         user = await Admin.create(userData);
@@ -68,45 +91,101 @@ export const register = async (req, res, next) => {
       default:
         return res.status(400).json({
           success: false,
-          message: 'Invalid role specified'
+          message: 'Invalid role specified',
         });
     }
 
     // Handle OTP based on provider and phone presence
     if (provider === 'local') {
       if (phone) {
-        // Send phone OTP and skip email OTP
         const phoneOtp = sendMockOTP(phone); // Logged to console
         user.phoneOTP = phoneOtp;
         user.phoneOTPExpires = Date.now() + 10 * 60 * 1000; // 10 minutes
-        user.isVerified = true; // Automatically verify email since phone OTP is used
+        user.isVerified = true; // Auto-verify email for phone OTP
         await user.save();
       } else {
-        // Generate OTP for email verification if no phone is provided
         const otp = generateOTP();
         user.otp = otp;
         user.otpExpires = Date.now() + 10 * 60 * 1000; // 10 minutes
         await user.save();
 
-        // Send verification email
-        await sendOTPEmail(email, otp);
+        try {
+          await sendOTPEmail(email, otp);
+        } catch (emailError) {
+          console.error('Email sending failed:', emailError);
+          return res.status(500).json({
+            success: false,
+            message: 'User registered, but failed to send OTP email.',
+          });
+        }
       }
     } else if (provider === 'google') {
-      user.isVerified = true; // Google users are auto-verified
+      user.isVerified = true;
       await user.save();
     }
 
     res.status(201).json({
       success: true,
-      message: provider === 'google' || phone ?
-        'User registered successfully. Please verify your phone if provided.' :
-        'User registered successfully. Please verify your email.',
-      data: {
-        id: user._id,
-        email: user.email,
-        role: user.role,
-        provider: user.provider
-      }
+      message: phone ? 'User registered successfully. Please verify your phone.' : 'User registered successfully. Please verify your email.',
+      data: { id: user._id, email: user.email, role: user.role, provider: user.provider },
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// Resend OTP
+export const resendOtp = async (req, res, next) => {
+  try {
+    const { email } = req.body;
+    const user = await User.findOne({ email }).select('+otp +otpExpires +phoneOTP +phoneOTPExpires');
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found',
+      });
+    }
+
+    if (user.isVerified && (!user.phone || user.isPhoneVerified)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Account already verified',
+      });
+    }
+
+    if (user.phone && !user.isPhoneVerified) {
+      const phoneOtp = sendMockOTP(user.phone);
+      user.phoneOTP = phoneOtp;
+      user.phoneOTPExpires = Date.now() + 10 * 60 * 1000;
+      await user.save();
+
+      return res.status(200).json({
+        success: true,
+        message: 'A new OTP has been sent to your phone.',
+        data: { id: user._id, email: user.email, role: user.role, provider: user.provider },
+      });
+    }
+
+    const otp = generateOTP();
+    user.otp = otp;
+    user.otpExpires = Date.now() + 10 * 60 * 1000;
+    await user.save();
+
+    try {
+      await sendOTPEmail(email, otp);
+    } catch (emailError) {
+      console.error('Email sending failed:', emailError);
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to send OTP email.',
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: 'A new OTP has been sent to your email.',
+      data: { id: user._id, email: user.email, role: user.role, provider: user.provider },
     });
   } catch (error) {
     next(error);
@@ -122,32 +201,29 @@ export const verifyEmail = async (req, res, next) => {
     if (!user) {
       return res.status(404).json({
         success: false,
-        message: 'User not found'
+        message: 'User not found',
       });
     }
 
-    // Check if OTP matches and isn't expired
     if (user.otp !== otp || user.otpExpires < Date.now()) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid or expired OTP'
+        message: 'Invalid or expired OTP',
       });
     }
 
-    // Mark user as verified
     user.isVerified = true;
     user.otp = undefined;
     user.otpExpires = undefined;
     await user.save();
 
-    // For students, notify admin for approval
     if (user.role === 'student') {
-      // You would typically send a notification to admin here
+      // Notify admin for approval (implement as needed)
     }
 
     res.status(200).json({
       success: true,
-      message: 'Email verified successfully'
+      message: 'Email verified successfully',
     });
   } catch (error) {
     next(error);
@@ -163,19 +239,17 @@ export const verifyPhone = async (req, res, next) => {
     if (!user) {
       return res.status(404).json({
         success: false,
-        message: 'User not found'
+        message: 'User not found',
       });
     }
 
-    // Check if OTP matches and isn't expired
-    if (!verifyMockOTP(phone, otp) || (user.phoneOTP !== otp || user.phoneOTPExpires < Date.now())) {
+    if (!verifyMockOTP(phone, otp) || user.phoneOTP !== otp || user.phoneOTPExpires < Date.now()) {
       return res.status(400).json({
         success: false,
-        message: 'Invalid or expired OTP'
+        message: 'Invalid or expired OTP',
       });
     }
 
-    // Mark phone as verified
     user.isPhoneVerified = true;
     user.phoneOTP = undefined;
     user.phoneOTPExpires = undefined;
@@ -183,7 +257,7 @@ export const verifyPhone = async (req, res, next) => {
 
     res.status(200).json({
       success: true,
-      message: 'Phone verified successfully'
+      message: 'Phone verified successfully',
     });
   } catch (error) {
     next(error);
