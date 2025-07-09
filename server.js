@@ -39,7 +39,7 @@ mongoose.connection.on("disconnected", () => {
 // Middleware
 app.use(
   cors({
-    origin: ["*"], 
+    origin: ["https://lms-web-application-bay.vercel.app", "http://localhost:5173"], 
     methods: "GET,POST,PUT,DELETE,PATCH",
     credentials: true,
   })
